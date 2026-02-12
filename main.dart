@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
-import 'animation_practice_screen.dart';
+import 'package:provider/provider.dart';
+import 'providers/movie_provider.dart';
+import 'screens/movie_list_screen.dart';
 
 void main() {
   runApp(const MyApp());
@@ -10,9 +12,15 @@ class MyApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return const MaterialApp(
-      debugShowCheckedModeBanner: false,
-      home: AnimationPracticeScreen(),
+    return ChangeNotifierProvider(
+      create: (_) => MovieProvider(),
+      child: MaterialApp(
+        title: 'Movie Catalog',
+        theme: ThemeData(
+          primarySwatch: Colors.deepPurple,
+        ),
+        home: const MovieListScreen(),
+      ),
     );
   }
 }
