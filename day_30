@@ -1,0 +1,216 @@
+import 'dart:async';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:get_it/get_it.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+final GetIt sl = GetIt.instance;
+
+
+class Task {
+  final int id;
+  final String title;
+  const Task({required this.id, required this.title});
+}
+
+
+abstract class ApiClient {
+  Future<List<Task>> fetchTasks();
+}
+
+class RealApiClient implements ApiClient {
+  @override
+  Future<List<Task>> fetchTasks() async {
+
+    await Future.delayed(const Duration(milliseconds: 400));
+    return const [
+      Task(id: 1, title: 'Real: from server'),
+      Task(id: 2, title: 'Real: another item'),
+    ];
+  }
+}
+
+class MockApiClient implements ApiClient {
+  @override
+  Future<List<Task>> fetchTasks() async {
+    await Future.delayed(const Duration(milliseconds: 50));
+    return const [
+      Task(id: 101, title: 'Mock: one'),
+      Task(id: 102, title: 'Mock: two'),
+    ];
+  }
+}
+
+
+
+abstract class TasksRepository {
+  Future<List<Task>> getTasks();
+}
+
+class TasksRepositoryImpl implements TasksRepository {
+  final ApiClient api;
+  TasksRepositoryImpl(this.api);
+
+  @override
+  Future<List<Task>> getTasks() => api.fetchTasks();
+}
+
+
+class GetTasksUseCase {
+  final TasksRepository repo;
+  GetTasksUseCase(this.repo);
+
+  Future<List<Task>> call() => repo.getTasks();
+}
+
+
+
+class AppBootstrap {
+  final SharedPreferences prefs;
+  AppBootstrap(this.prefs);
+
+  bool get firstRun => prefs.getBool('firstRun') ?? true;
+
+  Future<void> markLaunched() async {
+    await prefs.setBool('firstRun', false);
+  }
+}
+
+
+Future<void> configureDependencies() async {
+  sl.reset(dispose: true);
+
+
+  final prefs = await SharedPreferences.getInstance();
+  sl.registerSingleton<SharedPreferences>(prefs);
+  sl.registerSingleton<AppBootstrap>(AppBootstrap(prefs));
+
+ 
+  final bool useMock = !kReleaseMode; // debug/profile -> mock, release -> real
+  if (useMock) {
+    sl.registerLazySingleton<ApiClient>(() => MockApiClient());
+  } else {
+    sl.registerLazySingleton<ApiClient>(() => RealApiClient());
+  }
+
+  
+  sl.registerLazySingleton<TasksRepository>(() => TasksRepositoryImpl(sl<ApiClient>()));
+  sl.registerLazySingleton<GetTasksUseCase>(() => GetTasksUseCase(sl<TasksRepository>()));
+}
+
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  await configureDependencies(); // async init before runApp
+
+
+  final bootstrap = sl<AppBootstrap>();
+  if (bootstrap.firstRun) {
+    await bootstrap.markLaunched();
+  }
+
+  runApp(MyApp(
+
+    getTasks: sl<GetTasksUseCase>(),
+    isMock: !kReleaseMode,
+    firstRun: bootstrap.firstRun,
+  ));
+}
+
+
+class MyApp extends StatelessWidget {
+  final GetTasksUseCase getTasks;
+  final bool isMock;
+  final bool firstRun;
+
+  const MyApp({
+    super.key,
+    required this.getTasks,
+    required this.isMock,
+    required this.firstRun,
+  });
+
+
+  factory MyApp.fromDI() {
+    final bootstrap = sl<AppBootstrap>();
+    return MyApp(
+      getTasks: sl<GetTasksUseCase>(),
+      isMock: !kReleaseMode,
+      firstRun: bootstrap.firstRun,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      home: HomePage(
+        getTasks: getTasks,
+        isMock: isMock,
+        firstRun: firstRun,
+      ),
+    );
+  }
+}
+
+class HomePage extends StatefulWidget {
+  final GetTasksUseCase getTasks;
+  final bool isMock;
+  final bool firstRun;
+
+  const HomePage({
+    super.key,
+    required this.getTasks,
+    required this.isMock,
+    required this.firstRun,
+  });
+
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> {
+  late Future<List<Task>> _future;
+
+  @override
+  void initState() {
+    super.initState();
+    _future = widget.getTasks();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(widget.isMock ? 'Mock mode' : 'Real mode'),
+      ),
+      body: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (widget.firstRun) const Padding(
+            padding: EdgeInsets.all(12),
+            child: Text('First run detected (prefs init before runApp)'),
+          ),
+          Expanded(
+            child: FutureBuilder<List<Task>>(
+              future: _future,
+              builder: (context, snap) {
+                if (!snap.hasData) {
+                  return const Center(child: CircularProgressIndicator());
+                }
+                final items = snap.data!;
+                return ListView.builder(
+                  itemCount: items.length,
+                  itemBuilder: (_, i) => ListTile(
+                    title: Text(items[i].title),
+                    subtitle: Text('id: ${items[i].id}'),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
