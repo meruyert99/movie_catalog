@@ -1,0 +1,533 @@
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:drift/drift.dart';
+import 'package:drift_flutter/drift_flutter.dart';
+import 'package:flutter/material.dart';
+import 'package:path_provider/path_provider.dart';
+
+part 'main.g.dart';
+
+
+class Tags extends Table {
+  IntColumn get id => integer().autoIncrement()();
+  TextColumn get name => text().withLength(min: 1, max: 40)();
+  DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
+}
+
+class Tasks extends Table {
+  IntColumn get id => integer().autoIncrement()();
+
+  TextColumn get title => text().withLength(min: 1, max: 200)();
+  TextColumn get note => text().nullable()();
+
+
+  DateTimeColumn get dueAt => dateTime().nullable()();
+
+
+  IntColumn get priority => integer().withDefault(const Constant(1))();
+
+ 
+  IntColumn get tagId => integer().nullable().references(Tags, #id)();
+
+  BoolColumn get isDone => boolean().withDefault(const Constant(false))();
+
+  DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
+  DateTimeColumn get updatedAt => dateTime().withDefault(currentDateAndTime)();
+}
+
+// -------------------- DB --------------------
+
+@DriftDatabase(tables: [Tasks, Tags])
+class AppDb extends _$AppDb {
+  AppDb() : super(_openConnection());
+
+ 
+  @override
+  int get schemaVersion => 2;
+
+  @override
+  MigrationStrategy get migration => MigrationStrategy(
+        onCreate: (m) async => m.createAll(),
+        onUpgrade: (m, from, to) async {
+          // Example migration:
+          // Imagine schemaVersion=1 had no "priority" column.
+          if (from == 1) {
+            await m.addColumn(tasks, tasks.priority);
+            await customStatement(
+              'UPDATE tasks SET priority = 1 WHERE priority IS NULL;',
+            );
+          }
+        },
+      );
+
+
+  Future<int> addTag(String name) =>
+      into(tags).insert(TagsCompanion.insert(name: name.trim()));
+
+  Future<void> deleteTagById(int id) =>
+      (delete(tags)..where((t) => t.id.equals(id))).go();
+
+  Future<int> addTask({
+    required String title,
+    String? note,
+    DateTime? dueAt,
+    int priority = 1,
+    int? tagId,
+  }) {
+    return into(tasks).insert(TasksCompanion.insert(
+      title: title.trim(),
+      note: Value(note),
+      dueAt: Value(dueAt),
+      priority: Value(priority),
+      tagId: Value(tagId),
+      updatedAt: Value(DateTime.now()),
+    ));
+  }
+
+  Future<void> updateTask({
+    required int id,
+    String? title,
+    String? note,
+    DateTime? dueAt,
+    int? priority,
+    int? tagId,
+    bool? isDone,
+  }) {
+    return (update(tasks)..where((t) => t.id.equals(id))).write(TasksCompanion(
+      title: title == null ? const Value.absent() : Value(title.trim()),
+      note: note == null ? const Value.absent() : Value(note),
+      dueAt: dueAt == null ? const Value.absent() : Value(dueAt),
+      priority: priority == null ? const Value.absent() : Value(priority),
+      tagId: tagId == null ? const Value.absent() : Value(tagId),
+      isDone: isDone == null ? const Value.absent() : Value(isDone),
+      updatedAt: Value(DateTime.now()),
+    ));
+  }
+
+  Future<void> deleteTaskById(int id) =>
+      (delete(tasks)..where((t) => t.id.equals(id))).go();
+
+
+  Stream<List<TaskWithTag>> watchTasksWithTag(SortMode mode) {
+    final base = select(tasks);
+    _applySorting(base, mode);
+
+    final joined = base.join([
+      leftOuterJoin(tags, tags.id.equalsExp(tasks.tagId)),
+    ]);
+
+    return joined.watch().map((rows) {
+      return rows
+          .map((r) => TaskWithTag(
+                task: r.readTable(tasks),
+                tag: r.readTableOrNull(tags),
+              ))
+          .toList();
+    });
+  }
+
+  Future<List<TaskWithTag>> getTasksWithTag(SortMode mode) async {
+    final base = select(tasks);
+    _applySorting(base, mode);
+
+    final joined = base.join([
+      leftOuterJoin(tags, tags.id.equalsExp(tasks.tagId)),
+    ]);
+
+    final rows = await joined.get();
+    return rows
+        .map((r) => TaskWithTag(
+              task: r.readTable(tasks),
+              tag: r.readTableOrNull(tags),
+            ))
+        .toList();
+  }
+
+  void _applySorting(SimpleSelectStatement<Tasks, Task> q, SortMode mode) {
+    switch (mode) {
+      case SortMode.byDate:
+        q.orderBy([
+          (t) => OrderingTerm(
+                expression: t.dueAt,
+                mode: OrderingMode.asc,
+                nulls: NullsOrder.last,
+              ),
+          (t) => OrderingTerm(expression: t.createdAt, mode: OrderingMode.desc),
+        ]);
+        break;
+      case SortMode.byPriority:
+        q.orderBy([
+          (t) => OrderingTerm(expression: t.priority, mode: OrderingMode.desc),
+          (t) => OrderingTerm(expression: t.createdAt, mode: OrderingMode.desc),
+        ]);
+        break;
+    }
+  }
+
+
+
+  Future<File> exportJson() async {
+    final allTags = await select(tags).get();
+    final allTasks = await select(tasks).get();
+
+    final data = {
+      "tags": allTags
+          .map((t) => {
+                "id": t.id,
+                "name": t.name,
+                "createdAt": t.createdAt.toIso8601String(),
+              })
+          .toList(),
+      "tasks": allTasks
+          .map((t) => {
+                "id": t.id,
+                "title": t.title,
+                "note": t.note,
+                "dueAt": t.dueAt?.toIso8601String(),
+                "priority": t.priority,
+                "tagId": t.tagId,
+                "isDone": t.isDone,
+                "createdAt": t.createdAt.toIso8601String(),
+                "updatedAt": t.updatedAt.toIso8601String(),
+              })
+          .toList(),
+    };
+
+    final dir = await getApplicationDocumentsDirectory();
+    final file = File('${dir.path}/backup.json');
+    return file.writeAsString(jsonEncode(data));
+  }
+
+  /// Simple import: clears tables, re-inserts (ids may change)
+  Future<void> importJson(File file) async {
+    final raw = jsonDecode(await file.readAsString()) as Map<String, dynamic>;
+    final tagsJson = (raw["tags"] as List).cast<Map<String, dynamic>>();
+    final tasksJson = (raw["tasks"] as List).cast<Map<String, dynamic>>();
+
+    await transaction(() async {
+      // delete children first because of FK
+      await delete(tasks).go();
+      await delete(tags).go();
+
+      // Insert tags; keep a mapping oldId -> newId
+      final Map<int, int> tagIdMap = {};
+      for (final tj in tagsJson) {
+        final oldId = (tj["id"] as num).toInt();
+        final newId = await into(tags).insert(TagsCompanion.insert(
+          name: (tj["name"] as String),
+          createdAt: Value(DateTime.parse(tj["createdAt"] as String)),
+        ));
+        tagIdMap[oldId] = newId;
+      }
+
+      // Insert tasks, remap tagId
+      for (final tj in tasksJson) {
+        final oldTagId = (tj["tagId"] as num?)?.toInt();
+        final newTagId = oldTagId == null ? null : tagIdMap[oldTagId];
+
+        await into(tasks).insert(TasksCompanion.insert(
+          title: (tj["title"] as String),
+          note: Value(tj["note"] as String?),
+          dueAt: Value(tj["dueAt"] == null
+              ? null
+              : DateTime.parse(tj["dueAt"] as String)),
+          priority: Value(((tj["priority"] as num?)?.toInt()) ?? 1),
+          tagId: Value(newTagId),
+          isDone: Value((tj["isDone"] as bool?) ?? false),
+          createdAt: Value(DateTime.parse(tj["createdAt"] as String)),
+          updatedAt: Value(DateTime.parse(tj["updatedAt"] as String)),
+        ));
+      }
+    });
+  }
+}
+
+class TaskWithTag {
+  final Task task;
+  final Tag? tag;
+  TaskWithTag({required this.task, required this.tag});
+}
+
+enum SortMode { byDate, byPriority }
+
+LazyDatabase _openConnection() {
+  return LazyDatabase(() async {
+    // Drift Flutter already stores DB in app documents by default, but this is explicit
+    final dir = await getApplicationDocumentsDirectory();
+    final file = File('${dir.path}/app.sqlite');
+    return NativeDatabase(file);
+  });
+}
+
+// -------------------- UI --------------------
+
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(MyApp(db: AppDb()));
+}
+
+class MyApp extends StatelessWidget {
+  final AppDb db;
+  const MyApp({super.key, required this.db});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      home: TasksPage(db: db),
+    );
+  }
+}
+
+class TasksPage extends StatefulWidget {
+  final AppDb db;
+  const TasksPage({super.key, required this.db});
+
+  @override
+  State<TasksPage> createState() => _TasksPageState();
+}
+
+class _TasksPageState extends State<TasksPage> {
+  SortMode mode = SortMode.byDate;
+  bool useWatch = true;
+
+  int? selectedTagId; // nullable -> "no tag"
+  List<Tag> cachedTags = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadTags();
+  }
+
+  Future<void> _loadTags() async {
+    cachedTags = await widget.db.select(widget.db.tags).get();
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _addQuickTag() async {
+    final name = "Tag ${DateTime.now().second}";
+    await widget.db.addTag(name);
+    await _loadTags();
+  }
+
+  Future<void> _addQuickTask() async {
+    await widget.db.addTask(
+      title: "Task ${DateTime.now().minute}:${DateTime.now().second}",
+      priority: 1 + (DateTime.now().second % 3),
+      dueAt: DateTime.now().add(Duration(days: DateTime.now().second % 5)),
+      tagId: selectedTagId,
+    );
+    // if useWatch=false, need manual refresh
+    if (!useWatch) setState(() {});
+  }
+
+  Future<void> _export() async {
+    final file = await widget.db.exportJson();
+    _snack("Exported: ${file.path}");
+  }
+
+  Future<void> _import() async {
+    final dir = await getApplicationDocumentsDirectory();
+    final file = File('${dir.path}/backup.json');
+    if (!await file.exists()) {
+      _snack("No backup.json found in documents dir");
+      return;
+    }
+    await widget.db.importJson(file);
+    await _loadTags();
+    if (!useWatch) setState(() {});
+    _snack("Imported from backup.json");
+  }
+
+  void _snack(String msg) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final title = useWatch ? "Tasks (watch)" : "Tasks (get)";
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(title),
+        actions: [
+          IconButton(
+            tooltip: "Sort",
+            onPressed: () => setState(() => mode =
+                mode == SortMode.byDate ? SortMode.byPriority : SortMode.byDate),
+            icon: const Icon(Icons.sort),
+          ),
+          Row(
+            children: [
+              const Text("watch"),
+              Switch(
+                value: useWatch,
+                onChanged: (v) => setState(() => useWatch = v),
+              ),
+            ],
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          // Controls
+          Padding(
+            padding: const EdgeInsets.all(12),
+            child: Wrap(
+              spacing: 10,
+              runSpacing: 8,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                ElevatedButton.icon(
+                  onPressed: _addQuickTask,
+                  icon: const Icon(Icons.add),
+                  label: const Text("Add task"),
+                ),
+                OutlinedButton.icon(
+                  onPressed: _addQuickTag,
+                  icon: const Icon(Icons.label),
+                  label: const Text("Add tag"),
+                ),
+                OutlinedButton(
+                  onPressed: _export,
+                  child: const Text("Export JSON"),
+                ),
+                OutlinedButton(
+                  onPressed: _import,
+                  child: const Text("Import JSON"),
+                ),
+                const SizedBox(width: 10),
+                DropdownButton<int?>(
+                  value: selectedTagId,
+                  hint: const Text("Tag filter for new task"),
+                  items: [
+                    const DropdownMenuItem<int?>(
+                      value: null,
+                      child: Text("No tag"),
+                    ),
+                    ...cachedTags.map(
+                      (t) => DropdownMenuItem<int?>(
+                        value: t.id,
+                        child: Text(t.name),
+                      ),
+                    ),
+                  ],
+                  onChanged: (v) => setState(() => selectedTagId = v),
+                ),
+                Text(
+                  mode == SortMode.byDate ? "Sort: dueAt" : "Sort: priority",
+                ),
+              ],
+            ),
+          ),
+          const Divider(height: 1),
+          Expanded(
+            child: useWatch
+                ? StreamBuilder<List<TaskWithTag>>(
+                    stream: widget.db.watchTasksWithTag(mode),
+                    builder: (context, snap) {
+                      final items = snap.data ?? const [];
+                      return _TasksList(
+                        items: items,
+                        onToggleDone: (t) => widget.db.updateTask(
+                          id: t.id,
+                          isDone: !t.isDone,
+                        ),
+                        onIncPriority: (t) => widget.db.updateTask(
+                          id: t.id,
+                          priority: (t.priority % 3) + 1,
+                        ),
+                        onDelete: (t) => widget.db.deleteTaskById(t.id),
+                      );
+                    },
+                  )
+                : FutureBuilder<List<TaskWithTag>>(
+                    future: widget.db.getTasksWithTag(mode),
+                    builder: (context, snap) {
+                      final items = snap.data ?? const [];
+                      return _TasksList(
+                        items: items,
+                        onToggleDone: (t) async {
+                          await widget.db.updateTask(
+                            id: t.id,
+                            isDone: !t.isDone,
+                          );
+                          setState(() {}); // manual refresh
+                        },
+                        onIncPriority: (t) async {
+                          await widget.db.updateTask(
+                            id: t.id,
+                            priority: (t.priority % 3) + 1,
+                          );
+                          setState(() {});
+                        },
+                        onDelete: (t) async {
+                          await widget.db.deleteTaskById(t.id);
+                          setState(() {});
+                        },
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _TasksList extends StatelessWidget {
+  final List<TaskWithTag> items;
+  final Future<void> Function(Task task) onToggleDone;
+  final Future<void> Function(Task task) onIncPriority;
+  final Future<void> Function(Task task) onDelete;
+
+  const _TasksList({
+    required this.items,
+    required this.onToggleDone,
+    required this.onIncPriority,
+    required this.onDelete,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    if (items.isEmpty) {
+      return const Center(child: Text("Empty"));
+    }
+
+    return ListView.separated(
+      itemCount: items.length,
+      separatorBuilder: (_, __) => const Divider(height: 1),
+      itemBuilder: (_, i) {
+        final t = items[i].task;
+        final tagName = items[i].tag?.name ?? "—";
+        final due = t.dueAt == null ? "no date" : t.dueAt!.toLocal().toString();
+
+        return ListTile(
+          leading: Checkbox(
+            value: t.isDone,
+            onChanged: (_) => onToggleDone(t),
+          ),
+          title: Text(t.title),
+          subtitle: Text("tag: $tagName • pr: ${t.priority} • due: $due"),
+          trailing: Wrap(
+            spacing: 6,
+            children: [
+              IconButton(
+                tooltip: "Priority +",
+                icon: const Icon(Icons.priority_high),
+                onPressed: () => onIncPriority(t),
+              ),
+              IconButton(
+                tooltip: "Delete",
+                icon: const Icon(Icons.delete),
+                onPressed: () => onDelete(t),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
